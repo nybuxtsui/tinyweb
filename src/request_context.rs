@@ -120,7 +120,7 @@ impl RequestContext {
     fn strip_prefix(&mut self, param: &str) -> Option<Response<Body>> {
         if self.req.uri().path().starts_with(param) {
             if let Err(err) = self
-                .update_req_path(&self.req.uri().path().chars().skip(6).collect::<String>()) {
+                .update_req_path(&self.req.uri().path().chars().skip(param.len()).collect::<String>()) {
                 error!("update path failed: {err}");
             }
         }
