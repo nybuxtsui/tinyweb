@@ -54,5 +54,4 @@ impl ConfigRoute {
             (items[0], items[1])
         }
     }
-    
 }

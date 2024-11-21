@@ -1,7 +1,6 @@
-mod config;
-mod url;
-mod proxy;
 mod cache;
+mod config;
+mod proxy;
 mod request_context;
 
 use std::future::Future;
@@ -17,9 +16,7 @@ use axum::{
 use cache::CACHE;
 use config::{Config, ConfigRoute};
 use env_logger::Env;
-use http::
-    StatusCode
-;
+use http::StatusCode;
 use log::{debug, info};
 use request_context::RequestContext;
 use tokio::{fs::File, io::AsyncReadExt};
@@ -52,8 +49,7 @@ async fn main() {
     let bind = config.bind.clone();
     info!("config: {config:#?}");
 
-    env_logger::Builder::from_env(Env::default().default_filter_or(&config.log))
-        .init();
+    env_logger::Builder::from_env(Env::default().default_filter_or(&config.log)).init();
 
     let state = AppState { config };
 
@@ -98,7 +94,9 @@ where
                     let headers = r.headers().clone();
                     let bytes = to_bytes(r.into_body(), usize::MAX).await.unwrap();
                     if bytes.len() <= CACHE_LIMIT {
-                        CACHE.insert(key, (cache, status, headers.clone(), bytes.clone())).await;
+                        CACHE
+                            .insert(key, (cache, status, headers.clone(), bytes.clone()))
+                            .await;
                     }
                     (status, headers, bytes).into_response()
                 }
@@ -121,11 +119,7 @@ async fn handler(
 ) -> Response<Body> {
     debug!("new req: {}", req.uri());
 
-    let mut ctx = RequestContext {
-        req,
-        ws,
-        cache: 0,
-    };
+    let mut ctx = RequestContext { req, ws, cache: 0 };
 
     for route in &state.config.routes {
         if route.is_match(ctx.req.uri().path()) {

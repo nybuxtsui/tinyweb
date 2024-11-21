@@ -1,4 +1,7 @@
-use std::{sync::LazyLock, time::{Duration, Instant}};
+use std::{
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 
 use axum::body::Bytes;
 use http::{HeaderMap, StatusCode};
@@ -19,13 +22,12 @@ impl Expiry<String, (u64, StatusCode, HeaderMap, Bytes)> for MyExpiry {
     }
 }
 
+pub static CACHE: LazyLock<Cache<String, (u64, StatusCode, HeaderMap, Bytes)>> =
+    LazyLock::new(|| {
+        let expiry = MyExpiry;
 
-pub static CACHE: LazyLock<Cache<String, (u64, StatusCode, HeaderMap, Bytes)>> = LazyLock::new(|| {
-    let expiry = MyExpiry;
-
-    Cache::builder()
-        .max_capacity(10000)
-        .expire_after(expiry)
-        .build()
-});
-
+        Cache::builder()
+            .max_capacity(10000)
+            .expire_after(expiry)
+            .build()
+    });

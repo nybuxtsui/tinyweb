@@ -1,15 +1,23 @@
-use std::{sync::LazyLock, time::Duration};
+use std::{str::FromStr, sync::LazyLock, time::Duration};
 
-use axum::{body::Body, extract::{ws::{CloseFrame, Message, WebSocket}, Request}, response::{IntoResponse, Response}};
+use anyhow::Result;
+use axum::{
+    body::Body,
+    extract::{
+        ws::{CloseFrame, Message, WebSocket},
+        Request,
+    },
+    response::{IntoResponse, Response},
+};
 use futures_util::{SinkExt as _, StreamExt};
-use http::HeaderValue;
+use http::{HeaderValue, Uri};
 use log::{error, info};
 use reqwest::Client;
 use tokio::{select, time::timeout};
-use tokio_tungstenite::{connect_async, tungstenite::{protocol::CloseFrame as TCloseFrame, ClientRequestBuilder, Message as TMessage}};
-use anyhow::Result;
-
-use crate::url::Url;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{protocol::CloseFrame as TCloseFrame, ClientRequestBuilder, Message as TMessage},
+};
 
 fn change_msg_to_axum(msg: TMessage) -> Message {
     match msg {
@@ -17,15 +25,16 @@ fn change_msg_to_axum(msg: TMessage) -> Message {
         TMessage::Binary(vec) => Message::Binary(vec),
         TMessage::Ping(vec) => Message::Ping(vec),
         TMessage::Pong(vec) => Message::Pong(vec),
-        TMessage::Close(close_frame) => {
-            match close_frame {
-                Some(f) => Message::Close(Some(CloseFrame{code: f.code.into(), reason: f.reason})),
-                None => Message::Close(None),
-            }
-        }
+        TMessage::Close(close_frame) => match close_frame {
+            Some(f) => Message::Close(Some(CloseFrame {
+                code: f.code.into(),
+                reason: f.reason,
+            })),
+            None => Message::Close(None),
+        },
         TMessage::Frame(_) => {
             panic!("bad message");
-        },
+        }
     }
 }
 
@@ -35,12 +44,13 @@ fn change_msg_to_tungstenite(msg: Message) -> TMessage {
         Message::Binary(vec) => TMessage::Binary(vec),
         Message::Ping(vec) => TMessage::Ping(vec),
         Message::Pong(vec) => TMessage::Pong(vec),
-        Message::Close(close_frame) => {
-            match close_frame {
-                Some(f) => TMessage::Close(Some(TCloseFrame{code: f.code.into(), reason: f.reason})),
-                None => TMessage::Close(None)
-            }
-        }
+        Message::Close(close_frame) => match close_frame {
+            Some(f) => TMessage::Close(Some(TCloseFrame {
+                code: f.code.into(),
+                reason: f.reason,
+            })),
+            None => TMessage::Close(None),
+        },
     }
 }
 
@@ -54,11 +64,11 @@ pub async fn ws_proxy(mut socket: WebSocket, req: Request<Body>) {
                     let mut result = String::with_capacity(50);
                     result.push_str(host);
                     result
-                },
+                }
                 None => {
                     log::error!("ws_proxy failed: host is none");
                     return;
-                },
+                }
             };
             if let Some(port) = req.uri().port() {
                 host.push(':');
@@ -69,10 +79,12 @@ pub async fn ws_proxy(mut socket: WebSocket, req: Request<Body>) {
             match value.to_str() {
                 Ok(value) => {
                     builder = builder.with_header(name.as_str(), value);
-                },
+                }
                 Err(err) => {
-                    error!("skip req.header.value to_str failed: {err}, key={name} value={value:?}");
-                },
+                    error!(
+                        "skip req.header.value to_str failed: {err}, key={name} value={value:?}"
+                    );
+                }
             }
         }
     }
@@ -82,7 +94,7 @@ pub async fn ws_proxy(mut socket: WebSocket, req: Request<Body>) {
         Err(err) => {
             error!("connect websocket failed, {err}");
             return;
-        },
+        }
     };
     loop {
         select! {
@@ -144,26 +156,35 @@ static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(Duration::from_secs(90))
-        .build().unwrap()
+        .build()
+        .unwrap()
 });
 
 pub async fn http_proxy(req: Request<Body>) -> Result<Response<Body>> {
-    let url = Url::parse(&req.uri().to_string())?;
+    let uri = req.uri().clone();
     let mut headers = req.headers().clone();
 
-    if headers.contains_key(http::header::HOST) {
-        headers.remove(http::header::HOST);
-        headers.append(http::header::HOST, HeaderValue::from_str(&url.host)?);
-    }
+    let host = uri
+        .host()
+        .ok_or(anyhow::anyhow!("http_proxy: host is none"))?;
+
+    headers.insert(http::header::HOST, HeaderValue::from_str(host)?);
     if let Some(referer) = headers.get_mut(http::header::REFERER) {
-        let mut referer = Url::parse(referer.to_str()?)?;
-        referer.host = url.host.clone();
-        headers.remove(http::header::REFERER);
-        headers.append(http::header::REFERER, HeaderValue::from_str(&referer.to_str())?);
+        let referer = Uri::from_str(referer.to_str()?)?;
+        let mut uri = String::with_capacity(50);
+        uri.push_str(req.uri().scheme_str().unwrap_or(""));
+        uri.push_str("://");
+        uri.push_str(req.uri().host().unwrap_or(""));
+        uri.push_str(referer.path_and_query().map(|x| x.as_str()).unwrap_or("/"));
+        headers.insert(http::header::REFERER, HeaderValue::from_str(&uri)?);
     }
     if headers.contains_key(http::header::ORIGIN) {
         headers.remove(http::header::ORIGIN);
-        headers.append(http::header::ORIGIN, HeaderValue::from_str(&url.to_str_without_path())?);
+        let mut uri = String::with_capacity(50);
+        uri.push_str(req.uri().scheme_str().unwrap_or(""));
+        uri.push_str("://");
+        uri.push_str(req.uri().host().unwrap_or(""));
+        headers.insert(http::header::ORIGIN, HeaderValue::from_str(&uri)?);
     }
     info!("http_proxy -> {} {headers:?}", req.uri().to_string());
 
@@ -171,11 +192,15 @@ pub async fn http_proxy(req: Request<Body>) -> Result<Response<Body>> {
 
     let resp = timeout(
         Duration::from_secs(30),
-        HTTP_CLIENT.request(method.clone(), url.to_str())
+        HTTP_CLIENT
+            .request(method.clone(), req.uri().to_string())
             .headers(headers)
-            .body(reqwest::Body::wrap_stream(req.into_body().into_data_stream()))
-            .send()
-    ).await??;
+            .body(reqwest::Body::wrap_stream(
+                req.into_body().into_data_stream(),
+            ))
+            .send(),
+    )
+    .await??;
 
     let status = resp.status();
     let mut header = resp.headers().clone();

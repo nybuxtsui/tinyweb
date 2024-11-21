@@ -1,15 +1,19 @@
 use std::{borrow::Cow, net::IpAddr, path::PathBuf, str::FromStr as _};
 
-use axum::{body::Body, extract::{Request, WebSocketUpgrade}, response::{IntoResponse as _, Redirect, Response}};
-use http::{uri::{Authority, Scheme}, HeaderMap, HeaderValue, StatusCode, Uri};
+use anyhow::{anyhow, Result};
+use axum::{
+    body::Body,
+    extract::{Request, WebSocketUpgrade},
+    response::{IntoResponse as _, Redirect, Response},
+};
+use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use log::{debug, error, info};
 use tokio::io::AsyncReadExt as _;
 use tower::ServiceExt as _;
 use tower_http::services::ServeDir;
-use anyhow::{anyhow, Result};
 use wol::MacAddr;
 
-use crate::{fetch_from_cache, proxy, url::Url};
+use crate::{fetch_from_cache, proxy};
 
 pub struct RequestContext {
     pub ws: Option<WebSocketUpgrade>,
@@ -18,30 +22,6 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
-    fn update_req_scheme_host_and_port(&mut self, scheme: &str, host_and_port: &str) -> anyhow::Result<()> {
-        let mut parts = self.req.uri().clone().into_parts();
-        parts.scheme = Some(Scheme::from_str(scheme)?);
-        match parts.authority {
-            Some(authority) => {
-                let str_auth = authority.as_str();
-                let temp: String;
-                parts.authority = Some(Authority::from_str(match str_auth.rfind('@') {
-                    Some(pos) => {
-                        let user_and_pass = &str_auth[0..pos];
-                        temp = format!("{user_and_pass}@{host_and_port}");
-                        temp.as_str()
-                    }
-                    None => host_and_port,
-                })?);
-            }
-            None => {
-                parts.authority = Some(Authority::from_str(host_and_port)?);
-            }
-        }
-        *self.req.uri_mut() = http::Uri::from_parts(parts)?;
-        Ok(())
-    }
-
     pub async fn exec(&mut self, directive: (&str, &str)) -> Option<Response<Body>> {
         debug!("exec {directive:?}");
         match directive.0 {
@@ -52,11 +32,14 @@ impl RequestContext {
             "reverse_proxy" => self.reverse_proxy(directive.1).await,
             "file_server" => self.file_server(directive.1).await,
             "wol" => self.wol(directive.1),
-            _ => { Some((
+            _ => Some(
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     HeaderMap::new(),
                     format!("unknown directive: {}", directive.0),
-                ).into_response()) },
+                )
+                    .into_response(),
+            ),
         }
     }
 
@@ -64,9 +47,10 @@ impl RequestContext {
         Some(Redirect::permanent(param).into_response())
     }
 
-
     fn modify_path<'a, F>(&mut self, param: &'a str, f: F) -> anyhow::Result<()>
-        where F: for<'b> FnOnce(&'b str, &'b str) -> Option<Cow<'b, str>>, {
+    where
+        F: for<'b> FnOnce(&'b str, &'b str) -> Option<Cow<'b, str>>,
+    {
         let path_and_query = match self.req.uri().path_and_query() {
             None => return Ok(()),
             Some(path_and_query) => (path_and_query.path(), path_and_query.query()),
@@ -79,7 +63,7 @@ impl RequestContext {
                 } else {
                     s
                 }
-            },
+            }
         };
 
         match path_and_query.1 {
@@ -108,7 +92,6 @@ impl RequestContext {
         }
         Ok(())
     }
-
 
     fn strip_prefix(&mut self, param: &str) -> Option<Response<Body>> {
         match self.modify_path(param, |s, _| s.strip_prefix(param).map(Into::into)) {
@@ -144,14 +127,14 @@ impl RequestContext {
             0 => {
                 error!("wol: need argument");
                 return Some((StatusCode::OK, HeaderMap::new(), "ok").into_response());
-            },
-            1 => {
-                args[0].to_string()
-            },
+            }
+            1 => args[0].to_string(),
             2 => {
                 let ip = args[1].parse::<IpAddr>();
                 match ip {
-                    Ok(ip) => { bind_id = Some(ip); },
+                    Ok(ip) => {
+                        bind_id = Some(ip);
+                    }
                     Err(err) => {
                         error!("wol: bind_ip error: {err}");
                         return Some((StatusCode::OK, HeaderMap::new(), "ok").into_response());
@@ -169,7 +152,7 @@ impl RequestContext {
             Err(err) => {
                 error!("wol: mac error: {}", err);
                 return Some((StatusCode::OK, HeaderMap::new(), "ok").into_response());
-            },
+            }
         };
 
         tokio::task::spawn_blocking(move || {
@@ -178,15 +161,14 @@ impl RequestContext {
                 Ok(())
             }() {
                 Ok(_) => info!("send wol ok"),
-                Err(err) => error!{"send wol failed: {err}"},
+                Err(err) => error! {"send wol failed: {err}"},
             }
         });
         Some((StatusCode::OK, HeaderMap::new(), "ok").into_response())
     }
 
     async fn reverse_proxy(&mut self, param: &str) -> Option<Response<Body>> {
-        let old_url = self.req.uri().to_string();
-        let mut url = match Url::parse(param) {
+        let reverse_host = match Uri::from_str(param) {
             Ok(url) => url,
             Err(err) => {
                 return Some(
@@ -199,25 +181,42 @@ impl RequestContext {
                 );
             }
         };
-        url.path = self.req.uri().path().to_string();
-        let scheme = match url.scheme {
-            Some(scheme) => scheme,
+
+        let mut target = String::with_capacity(100);
+
+        match reverse_host.scheme() {
+            Some(scheme) => target.push_str(scheme.as_str()),
             None => {
                 if self.ws.is_some() {
-                    "ws"
+                    target.push_str("ws");
                 } else {
-                    "http"
+                    target.push_str("http");
                 }
-                .to_string()
             }
         };
+        target.push_str("://");
+        match reverse_host.authority() {
+            Some(authority) => {
+                target.push_str(authority.as_str());
+            }
+            None => {
+                log::error!("ws_proxy failed: host is none");
+                return Some(
+                    (StatusCode::INTERNAL_SERVER_ERROR, HeaderMap::new(), "").into_response(),
+                );
+            }
+        }
+        target.push_str(self.req.uri().path());
+        if let Some(query) = self.req.uri().query() {
+            target.push('?');
+            target.push_str(query);
+        }
 
-        self.update_req_scheme_host_and_port(&scheme, &url.host).unwrap();
-        debug!("reverse_proxy {param} {old_url} => {}", self.req.uri().to_string());
+        let mut req = std::mem::take(&mut self.req);
+        *req.uri_mut() = Uri::from_str(&target).unwrap();
+        debug!("reverse_proxy {param} => {}", req.uri().to_string());
 
-        let ws = std::mem::take(&mut self.ws);
-        let req = std::mem::take(&mut self.req);
-        match ws {
+        match std::mem::take(&mut self.ws) {
             Some(ws) => Some(
                 ws.on_upgrade(move |socket| proxy::ws_proxy(socket, req))
                     .into_response(),
@@ -225,20 +224,19 @@ impl RequestContext {
             None => {
                 let key = format!("rproxy:{}", req.uri());
                 debug!("cache key: {key}");
-                Some(
-                    if self.cache == 0 {
-                        match proxy::http_proxy(req).await {
-                            Ok(resp) => resp,
-                            Err(e) => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                HeaderMap::new(),
-                                e.to_string(),
-                            ).into_response(),
-                        }
-                    } else {
-                        fetch_from_cache(key, self.cache, || proxy::http_proxy(req)).await
+                Some(if self.cache == 0 {
+                    match proxy::http_proxy(req).await {
+                        Ok(resp) => resp,
+                        Err(e) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            HeaderMap::new(),
+                            e.to_string(),
+                        )
+                            .into_response(),
                     }
-                )
+                } else {
+                    fetch_from_cache(key, self.cache, || proxy::http_proxy(req)).await
+                })
             }
         }
     }
@@ -265,9 +263,7 @@ impl RequestContext {
         }
         if !pathbuf.exists() {
             error!("path {} notfound", pathbuf.to_string_lossy());
-            return Some(
-                (StatusCode::NOT_FOUND, HeaderMap::new(), "not found").into_response(),
-            );
+            return Some((StatusCode::NOT_FOUND, HeaderMap::new(), "not found").into_response());
         }
         let len = pathbuf.metadata().map(|m| m.len()).unwrap_or(0);
         if self.cache == 0 || len == 0 || len > crate::CACHE_LIMIT as u64 {
@@ -280,43 +276,46 @@ impl RequestContext {
         }
 
         let key = format!("file:{}", pathbuf.to_string_lossy());
-        Some(fetch_from_cache(key, self.cache, || async {
-            debug!("ServeFile by local: {}", pathbuf.to_string_lossy());
-            let mut file = match tokio::fs::File::open(&pathbuf).await {
-                Ok(file) => file,
-                Err(err) => {
-                    error!("path {} open failed: {err}", pathbuf.to_string_lossy());
-                    return Err(anyhow!(err));
-                }
-            };
-            let mut buf = vec![0u8; 256 * 1024];
-            let len = match file.read(&mut buf).await {
-                Ok(len) => len,
-                Err(err) => {
-                    error!("read failed: {err}");
-                    return Err(anyhow!(err));
-                }
-            };
-            buf.truncate(len);
-            let content_type = mime_guess::from_path(&pathbuf)
-                .first_or_octet_stream()
-                .to_string();
-            debug!(
-                "ServeFile by local: {}, read len={} type={}",
-                pathbuf.to_string_lossy(),
-                len,
-                content_type
-            );
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                http::header::CONTENT_TYPE,
-                HeaderValue::from_str(&content_type).unwrap(),
-            );
-            headers.insert(
-                http::header::CONTENT_LENGTH,
-                HeaderValue::from_str(&len.to_string()).unwrap(),
-            );
-            Ok((StatusCode::OK, headers, buf).into_response())
-        }).await)
+        Some(
+            fetch_from_cache(key, self.cache, || async {
+                debug!("ServeFile by local: {}", pathbuf.to_string_lossy());
+                let mut file = match tokio::fs::File::open(&pathbuf).await {
+                    Ok(file) => file,
+                    Err(err) => {
+                        error!("path {} open failed: {err}", pathbuf.to_string_lossy());
+                        return Err(anyhow!(err));
+                    }
+                };
+                let mut buf = vec![0u8; 256 * 1024];
+                let len = match file.read(&mut buf).await {
+                    Ok(len) => len,
+                    Err(err) => {
+                        error!("read failed: {err}");
+                        return Err(anyhow!(err));
+                    }
+                };
+                buf.truncate(len);
+                let content_type = mime_guess::from_path(&pathbuf)
+                    .first_or_octet_stream()
+                    .to_string();
+                debug!(
+                    "ServeFile by local: {}, read len={} type={}",
+                    pathbuf.to_string_lossy(),
+                    len,
+                    content_type
+                );
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_str(&content_type).unwrap(),
+                );
+                headers.insert(
+                    http::header::CONTENT_LENGTH,
+                    HeaderValue::from_str(&len.to_string()).unwrap(),
+                );
+                Ok((StatusCode::OK, headers, buf).into_response())
+            })
+            .await,
+        )
     }
 }
