@@ -1,7 +1,7 @@
-use std::{net::IpAddr, path::PathBuf, str::FromStr as _};
+use std::{borrow::Cow, net::IpAddr, path::PathBuf, str::FromStr as _};
 
 use axum::{body::Body, extract::{Request, WebSocketUpgrade}, response::{IntoResponse as _, Redirect, Response}};
-use http::{uri::{Authority, Scheme}, HeaderMap, HeaderValue, StatusCode};
+use http::{uri::{Authority, Scheme}, HeaderMap, HeaderValue, StatusCode, Uri};
 use log::{debug, error, info};
 use tokio::io::AsyncReadExt as _;
 use tower::ServiceExt as _;
@@ -10,7 +10,6 @@ use anyhow::{anyhow, Result};
 use wol::MacAddr;
 
 use crate::{fetch_from_cache, proxy, url::Url};
-
 
 pub struct RequestContext {
     pub ws: Option<WebSocketUpgrade>,
@@ -43,58 +42,6 @@ impl RequestContext {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn update_req_scheme(&mut self, scheme: &str) -> anyhow::Result<()> {
-        let mut parts = self.req.uri().clone().into_parts();
-        parts.scheme = Some(Scheme::from_str(scheme)?);
-        *self.req.uri_mut() = http::Uri::from_parts(parts)?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn update_req_host_and_port(&mut self, host_and_port: &str) -> anyhow::Result<()> {
-        let mut parts = self.req.uri().clone().into_parts();
-        match parts.authority {
-            Some(authority) => {
-                let str_auth = authority.as_str();
-                let temp: String;
-                parts.authority = Some(Authority::from_str(match str_auth.rfind('@') {
-                    Some(pos) => {
-                        let user_and_pass = &str_auth[0..pos];
-                        temp = format!("{user_and_pass}@{host_and_port}");
-                        temp.as_str()
-                    }
-                    None => host_and_port,
-                })?);
-            }
-            None => {
-                parts.authority = Some(Authority::from_str(host_and_port)?);
-            }
-        }
-        *self.req.uri_mut() = http::Uri::from_parts(parts)?;
-        Ok(())
-    }
-
-    fn update_req_path(&mut self, new_path: &str) -> anyhow::Result<()> {
-        let mut parts = self.req.uri().clone().into_parts();
-        parts.path_and_query = self.req.uri().path_and_query().cloned();
-        match parts.path_and_query {
-            Some(paq) => match paq.query() {
-                Some(query) => {
-                    parts.path_and_query = Some(format!("{new_path}?{query}").parse()?);
-                }
-                None => {
-                    parts.path_and_query = Some(new_path.parse()?);
-                }
-            },
-            None => {
-                parts.path_and_query = Some(new_path.parse()?);
-            }
-        }
-        *self.req.uri_mut() = http::Uri::from_parts(parts)?;
-        Ok(())
-    }
-
     pub async fn exec(&mut self, directive: (&str, &str)) -> Option<Response<Body>> {
         debug!("exec {directive:?}");
         match directive.0 {
@@ -117,19 +64,64 @@ impl RequestContext {
         Some(Redirect::permanent(param).into_response())
     }
 
-    fn strip_prefix(&mut self, param: &str) -> Option<Response<Body>> {
-        if self.req.uri().path().starts_with(param) {
-            if let Err(err) = self
-                .update_req_path(&self.req.uri().path().chars().skip(param.len()).collect::<String>()) {
-                error!("update path failed: {err}");
+
+    fn modify_path<'a, F>(&mut self, param: &'a str, f: F) -> anyhow::Result<()>
+        where F: for<'b> FnOnce(&'b str, &'b str) -> Option<Cow<'b, str>>, {
+        let path_and_query = match self.req.uri().path_and_query() {
+            None => return Ok(()),
+            Some(path_and_query) => (path_and_query.path(), path_and_query.query()),
+        };
+        let path = match f(path_and_query.0, param) {
+            None => return Ok(()),
+            Some(s) => {
+                if s.is_empty() {
+                    Cow::Borrowed("/")
+                } else {
+                    s
+                }
+            },
+        };
+
+        match path_and_query.1 {
+            None => {
+                *self.req.uri_mut() = match Uri::from_str(path.as_ref()) {
+                    Ok(uri) => uri,
+                    Err(err) => {
+                        log::error!("uri invalid: {}, uri={}", err, path);
+                        anyhow::bail!(err);
+                    }
+                }
             }
+            Some(query) => {
+                let mut new_path = String::with_capacity(50);
+                new_path.push_str(path.as_ref());
+                new_path.push('?');
+                new_path.push_str(query);
+                *self.req.uri_mut() = match Uri::from_str(&new_path) {
+                    Ok(uri) => uri,
+                    Err(err) => {
+                        log::error!("uri invalid: {}, uri={}", err, path);
+                        anyhow::bail!(err);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+
+    fn strip_prefix(&mut self, param: &str) -> Option<Response<Body>> {
+        match self.modify_path(param, |s, _| s.strip_prefix(param).map(Into::into)) {
+            Ok(_) => (),
+            Err(err) => error!("update path failed: {err}"),
         }
         None
     }
 
     fn rewrite(&mut self, param: &str) -> Option<Response<Body>> {
-        if let Err(err) = self.update_req_path(param) {
-            error!("update path failed: {err}");
+        match self.modify_path(param, |_, s| Some(Cow::Borrowed(s))) {
+            Ok(_) => (),
+            Err(err) => error!("update path failed: {err}"),
         }
         None
     }
@@ -145,16 +137,44 @@ impl RequestContext {
         None
     }
 
-    fn wol(&mut self, mac: &str) -> Option<Response<Body>> {
-        let mac = mac.to_owned();
+    fn wol(&mut self, param: &str) -> Option<Response<Body>> {
+        let mut bind_id = None;
+        let args: Vec<_> = param.split_ascii_whitespace().collect();
+        let mac = match args.len() {
+            0 => {
+                error!("wol: need argument");
+                return Some((StatusCode::OK, HeaderMap::new(), "ok").into_response());
+            },
+            1 => {
+                args[0].to_string()
+            },
+            2 => {
+                let ip = args[1].parse::<IpAddr>();
+                match ip {
+                    Ok(ip) => { bind_id = Some(ip); },
+                    Err(err) => {
+                        error!("wol: bind_ip error: {err}");
+                        return Some((StatusCode::OK, HeaderMap::new(), "ok").into_response());
+                    }
+                }
+                args[0].to_string()
+            }
+            _ => {
+                error!("wol: argument error: {}", param);
+                return Some((StatusCode::OK, HeaderMap::new(), "ok").into_response());
+            }
+        };
+        let mac = match MacAddr::from_str(&mac) {
+            Ok(mac) => mac,
+            Err(err) => {
+                error!("wol: mac error: {}", err);
+                return Some((StatusCode::OK, HeaderMap::new(), "ok").into_response());
+            },
+        };
+
         tokio::task::spawn_blocking(move || {
             match || -> Result<()> {
-                let mac = match MacAddr::from_str(&mac) {
-                    Ok(mac) => Ok(mac),
-                    Err(err) => Err(anyhow!(err)),
-                }?;
-                let bind_ip = "10.0.0.4".parse::<IpAddr>()?;
-                wol::send_wol(mac, None, Some(bind_ip))?;
+                wol::send_wol(mac, None, bind_id)?;
                 Ok(())
             }() {
                 Ok(_) => info!("send wol ok"),
@@ -191,6 +211,7 @@ impl RequestContext {
                 .to_string()
             }
         };
+
         self.update_req_scheme_host_and_port(&scheme, &url.host).unwrap();
         debug!("reverse_proxy {param} {old_url} => {}", self.req.uri().to_string());
 

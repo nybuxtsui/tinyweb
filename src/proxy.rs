@@ -5,7 +5,7 @@ use futures_util::{SinkExt as _, StreamExt};
 use http::HeaderValue;
 use log::{error, info};
 use reqwest::Client;
-use tokio::{select, sync::mpsc, time::timeout};
+use tokio::{select, time::timeout};
 use tokio_tungstenite::{connect_async, tungstenite::{protocol::CloseFrame as TCloseFrame, ClientRequestBuilder, Message as TMessage}};
 use anyhow::Result;
 
@@ -49,7 +49,22 @@ pub async fn ws_proxy(mut socket: WebSocket, req: Request<Body>) {
     let mut builder = ClientRequestBuilder::new(req.uri().clone());
     for (name, value) in req.headers() {
         if name == http::header::HOST {
-            builder = builder.with_header(name.as_str(), "10.0.0.4:9090");
+            let mut host = match req.uri().host() {
+                Some(host) => {
+                    let mut result = String::with_capacity(50);
+                    result.push_str(host);
+                    result
+                },
+                None => {
+                    log::error!("ws_proxy failed: host is none");
+                    return;
+                },
+            };
+            if let Some(port) = req.uri().port() {
+                host.push(':');
+                host.push_str(port.as_str());
+            }
+            builder = builder.with_header(name.as_str(), host);
         } else {
             match value.to_str() {
                 Ok(value) => {
@@ -61,8 +76,6 @@ pub async fn ws_proxy(mut socket: WebSocket, req: Request<Body>) {
             }
         }
     }
-    let (tx_up, mut rx_down) = mpsc::unbounded_channel::<Message>();
-    let (tx_down, mut rx_up) = mpsc::unbounded_channel::<Message>();
 
     let (mut up, _) = match connect_async(builder).await {
         Ok(v) => v,
@@ -71,59 +84,38 @@ pub async fn ws_proxy(mut socket: WebSocket, req: Request<Body>) {
             return;
         },
     };
-    tokio::spawn(async move {
-        loop {
-            select! {
-                msg = up.next() => {
-                    match msg {
-                        Some(msg) => {
-                            match msg {
-                                Ok(msg) => {
-                                    let r = tx_up.send(change_msg_to_axum(msg));
-                                    match r {
-                                        Ok(_) => (),
-                                        Err(e) => {
-                                            error!("websocket send error: {e}");
-                                            break;
-                                        },
-                                    }
-                                },
-                                Err(_) => {
-                                    break;
-                                }
-                            }
-                        },
-                        None => {
-                            break;
-                        },
-                    }
-                },
-                msg = rx_up.recv() => {
-                    match msg {
-                        Some(msg) => {
-                            let r = up.send(change_msg_to_tungstenite(msg)).await;
-                            match r {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!("websocket send error: {e}");
-                                    break;
-                                },
-                            }
-                        },
-                        None => {break;},
-                    }
-                }
-            }
-        }
-    });
     loop {
         select! {
+            msg = up.next() => {
+                match msg {
+                    Some(msg) => {
+                        match msg {
+                            Ok(msg) => {
+                                let r = socket.send(change_msg_to_axum(msg)).await;
+                                match r {
+                                    Ok(_) => (),
+                                    Err(e) => {
+                                        error!("websocket send error: {e}");
+                                        break;
+                                    },
+                                }
+                            },
+                            Err(_) => {
+                                break;
+                            }
+                        }
+                    },
+                    None => {
+                        break;
+                    },
+                }
+            },
             msg = socket.recv() => {
                 match msg {
                     Some(msg) => {
                         match msg {
                             Ok(msg) => {
-                                let r = tx_down.send(msg);
+                                let r = up.send(change_msg_to_tungstenite(msg)).await;
                                 match r {
                                     Ok(_) => (),
                                     Err(_) => {break;},
@@ -139,18 +131,6 @@ pub async fn ws_proxy(mut socket: WebSocket, req: Request<Body>) {
                     },
                 }
             },
-            msg = rx_down.recv() => {
-                match msg {
-                    Some(msg) => {
-                        let r = socket.send(msg).await;
-                        match r {
-                            Ok(_) => (),
-                            Err(_) => {break;},
-                        }
-                    },
-                    None => {break;},
-                }
-            }
         }
     }
 }
